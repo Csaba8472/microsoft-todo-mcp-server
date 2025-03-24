@@ -101,3 +101,14 @@ complete-task - Mark a task as complete (simpler than using update-task)
 list-my-tasks - Show tasks across lists with filtering by status/date without requiring complex OData queries
 reschedule-task - Push a task's due date forward by a certain number of days
 prioritize-tasks - Automatically sort tasks by importance, due date, etc.
+
+Options to Make It Compatible
+To make this work more like standard MCP servers, you'd need to:
+Modify the authentication approach:
+Package the auth logic directly into the MCP server
+Add a way to handle first-time auth within the server startup
+Support environment variable-based token injection like the GitHub example
+Package it properly:
+Create a proper npm package that includes both the server and auth logic
+Set up the package.json to make it runnable via npx
+For now, the best approach is to follow the current setup steps - install locally, run the separate auth process, and then configure Claude to point to the local build.

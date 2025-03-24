@@ -27,8 +27,28 @@ const TOKEN_FILE_PATH = join(process.cwd(), 'tokens.json');
 const msalConfig = {
   auth: {
     clientId: process.env.CLIENT_ID,
-    authority: 'https://login.microsoftonline.com/consumers',
+    authority: `https://login.microsoftonline.com/${process.env.TENANT_ID}`,
     clientSecret: process.env.CLIENT_SECRET,
+  },
+  system: {
+    loggerOptions: {
+      loggerCallback(loglevel, message, containsPii) {
+        console.log(`MSAL Log: ${message}`);
+      },
+      piiLoggingEnabled: true
+    }
+  },
+  cache: {
+    cachePlugin: {
+      beforeCacheAccess: async (cacheContext) => {
+        console.log('Cache access requested:', cacheContext);
+        return null;
+      },
+      afterCacheAccess: async (cacheContext) => {
+        console.log('Cache access completed:', cacheContext);
+        return null;
+      }
+    }
   }
 };
 
@@ -36,10 +56,14 @@ console.log('MSAL config created');
 
 // Task-related permission scopes
 const scopes = [
+  'offline_access',  // Put offline_access first to ensure it's not dropped
+  'openid',         // Add openid scope
+  'profile',        // Add profile scope
   'Tasks.Read',
   'Tasks.Read.Shared',
   'Tasks.ReadWrite',
-  'Tasks.ReadWrite.Shared'
+  'Tasks.ReadWrite.Shared',
+  'User.Read'
 ];
 
 // Create MSAL application
@@ -57,7 +81,16 @@ app.get('/', (req, res) => {
   const authCodeUrlParameters = {
     scopes: scopes,
     redirectUri: process.env.REDIRECT_URI || `http://localhost:${port}/callback`,
+    prompt: 'consent',  // Use only consent to force refresh token
+    responseMode: 'query',
   };
+
+  console.log('Auth parameters:', {
+    scopes: scopes,
+    redirectUri: process.env.REDIRECT_URI || `http://localhost:${port}/callback`,
+    prompt: 'consent',
+    responseMode: 'query',
+  });
 
   cca.getAuthCodeUrl(authCodeUrlParameters)
     .then((response) => {
@@ -72,32 +105,62 @@ app.get('/', (req, res) => {
 
 // Handle the callback from Microsoft login
 app.get('/callback', (req, res) => {
-  console.log('Callback route accessed with code:', req.query.code ? 'Present (hidden)' : 'Missing');
+  console.log('Callback route accessed');
+  console.log('Query parameters:', {
+    code: req.query.code ? 'Present (hidden)' : 'Missing',
+    state: req.query.state ? 'Present' : 'Missing',
+    error: req.query.error || 'None',
+    error_description: req.query.error_description || 'None'
+  });
+
   const tokenRequest = {
     code: req.query.code,
     scopes: scopes,
     redirectUri: process.env.REDIRECT_URI || `http://localhost:${port}/callback`,
   };
 
+  console.log('Token request parameters:', {
+    scopes: scopes,
+    redirectUri: process.env.REDIRECT_URI || `http://localhost:${port}/callback`,
+  });
+
   cca.acquireTokenByCode(tokenRequest)
     .then((response) => {
       try {
-        console.log('Token response received:', Object.keys(response).join(', '));
-        console.log('Response contains expiresIn:', response.expiresIn ? 'Yes' : 'No');
-        console.log('Response contains expiresOn:', response.expiresOn ? 'Yes' : 'No');
-        
+        // Log full response structure (without sensitive values)
+        console.log('Token response structure:', {
+          keys: Object.keys(response),
+          hasAccessToken: !!response.accessToken,
+          hasRefreshToken: !!response.refreshToken,
+          hasIdToken: !!response.idToken,
+          tokenType: response.tokenType,
+          expiresIn: response.expiresIn,
+          expiresOn: response.expiresOn,
+          scopes: response.scopes,
+          account: response.account ? {
+            username: response.account.username,
+            tenantId: response.account.tenantId,
+            localAccountId: response.account.localAccountId
+          } : null
+        });
+
         // Calculate token expiration (make sure it's never null)
-        // Default to 1 hour if expiresIn is not available
         const expiresInSeconds = response.expiresIn || 3600;
         const expiresAt = Date.now() + (expiresInSeconds * 1000) - (5 * 60 * 1000);
         
-        console.log('Calculated expiresAt:', expiresAt, 'which is', new Date(expiresAt).toLocaleString());
+        console.log('Token expiration details:', {
+          expiresInSeconds,
+          expiresAt: new Date(expiresAt).toLocaleString(),
+          currentTime: new Date().toLocaleString()
+        });
         
         // Store tokens
         const tokenData = {
           accessToken: response.accessToken,
-          refreshToken: response.refreshToken || '', // Handle potentially missing refresh token
-          expiresAt: expiresAt
+          refreshToken: response.refreshToken || '',
+          expiresAt: expiresAt,
+          tokenType: response.tokenType,
+          scopes: response.scopes
         };
         
         writeFileSync(TOKEN_FILE_PATH, JSON.stringify(tokenData, null, 2), 'utf8');
@@ -120,8 +183,16 @@ app.get('/callback', (req, res) => {
           <ul>
             <li>Access Token: ${accessTokenDisplay}</li>
             <li>Refresh Token: ${refreshTokenDisplay}</li>
+            <li>Token Type: ${response.tokenType || 'Not provided'}</li>
+            <li>Scopes: ${response.scopes ? response.scopes.join(', ') : 'Not provided'}</li>
             <li>Expires: ${new Date(expiresAt).toLocaleString()}</li>
           </ul>
+          <p>Debug Information:</p>
+          <pre>${JSON.stringify({
+            hasRefreshToken: !!response.refreshToken,
+            tokenType: response.tokenType,
+            scopes: response.scopes
+          }, null, 2)}</pre>
         `);
       } catch (error) {
         console.error('Error saving token:', error);
@@ -129,7 +200,13 @@ app.get('/callback', (req, res) => {
       }
     })
     .catch((error) => {
-      console.error('Token acquisition error:', error);
+      console.error('Token acquisition error:', {
+        errorCode: error.errorCode,
+        errorMessage: error.errorMessage,
+        subError: error.subError,
+        correlationId: error.correlationId,
+        stack: error.stack
+      });
       res.status(500).send(`Error acquiring token: ${JSON.stringify(error)}`);
     });
 });
