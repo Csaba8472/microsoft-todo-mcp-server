@@ -69,6 +69,11 @@ To use this MCP service, you need to register an application in the Azure portal
    ```
    npm run auth
    ```
+   If your browser doesn't open automatically, manually navigate to:
+   ```
+   http://localhost:3000
+   ```
+
 5. Build the MCP service:
    ```
    npm run build
@@ -156,4 +161,8 @@ The service uses Microsoft's OAuth 2.0 for authentication. The token is stored l
 To re-authenticate, run:
 ```
 npm run auth
-``` 
+```
+
+## License
+
+This project is released under the MIT License. Feel free to modify and distribute it as needed. 
