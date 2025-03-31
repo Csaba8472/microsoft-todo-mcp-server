@@ -1,7 +1,7 @@
 // Authentication server for Microsoft Todo MCP service
 import dotenv from 'dotenv';
 import express from 'express';
-import { writeFileSync } from 'fs';
+import fs from 'fs';
 import { join } from 'path';
 import { ConfidentialClientApplication } from '@azure/msal-node';
 import { fileURLToPath } from 'url';
@@ -75,6 +75,150 @@ app.get('/test', (req, res) => {
   res.send('Auth server is running correctly');
 });
 
+// Helper function to refresh an access token
+async function refreshAccessToken() {
+  try {
+    // Get account info from the token cache
+    const tokenCache = cca.getTokenCache();
+    const accounts = await tokenCache.getAllAccounts();
+    
+    if (accounts.length === 0) {
+      console.log('No accounts found in the token cache');
+      return { success: false, error: 'No accounts found in token cache' };
+    }
+    
+    // Get the first account (we should have only one in this scenario)
+    const account = accounts[0];
+    console.log('Found account in token cache:', {
+      username: account.username,
+      localAccountId: account.localAccountId,
+      tenantId: account.tenantId
+    });
+    
+    // Create a silent request using the account
+    const silentRequest = {
+      account: account,
+      scopes: scopes,
+      forceRefresh: true
+    };
+    
+    console.log('Attempting to acquire token silently...');
+    const response = await cca.acquireTokenSilent(silentRequest);
+    
+    console.log('Token refreshed successfully');
+    return {
+      success: true,
+      response: response,
+      accessToken: response.accessToken,
+      expiresAt: Date.now() + ((response.expiresIn || 3600) * 1000) - (5 * 60 * 1000)
+    };
+  } catch (error) {
+    console.error('Error refreshing token silently:', error);
+    return {
+      success: false,
+      error: error
+    };
+  }
+}
+
+// Update refresh endpoint to use acquireTokenSilent
+app.get('/refresh', async (req, res) => {
+  try {
+    const result = await refreshAccessToken();
+    
+    if (result.success) {
+      // Save updated token data
+      const tokenData = {
+        accessToken: result.accessToken,
+        expiresAt: result.expiresAt,
+        tokenType: result.response.tokenType,
+        scopes: result.response.scopes
+      };
+      
+      // Save updated token data
+      fs.writeFileSync(TOKEN_FILE_PATH, JSON.stringify(tokenData, null, 2), 'utf8');
+      
+      res.json({
+        success: true,
+        message: 'Token refreshed successfully',
+        expiresAt: new Date(result.expiresAt).toISOString()
+      });
+    } else {
+      // If silent refresh fails, redirect to login
+      console.log('Silent token refresh failed, redirecting to login');
+      res.json({
+        success: false,
+        message: 'Token refresh failed, please login again',
+        redirectUrl: '/'
+      });
+    }
+  } catch (error) {
+    console.error('Error in refresh route:', error);
+    res.status(500).send(`Error refreshing token: ${error.message}`);
+  }
+});
+
+// Add a client credentials flow endpoint
+app.get('/silentLogin', async (req, res) => {
+  try {
+    console.log('Silent login endpoint accessed');
+    
+    // Client credentials flow requires different scopes format
+    // We use resource/.default pattern here
+    const clientCredentialRequest = {
+      scopes: ['https://graph.microsoft.com/.default'],
+      skipCache: true  // Force request to go to the server
+    };
+    
+    console.log('Attempting client credentials flow with scopes:', clientCredentialRequest.scopes);
+    
+    const response = await cca.acquireTokenByClientCredential(clientCredentialRequest);
+    
+    console.log('Client credentials response received', {
+      hasAccessToken: !!response.accessToken,
+      tokenType: response.tokenType,
+      expiresOn: response.expiresOn,
+      scopes: response.scopes
+    });
+    
+    // Get token cache after successful client credentials flow
+    const tokenCache = cca.getTokenCache();
+    const serializedCache = await tokenCache.serialize();
+    const cacheJson = JSON.parse(serializedCache);
+    
+    console.log('Token cache after client credentials flow:', {
+      hasRefreshTokens: !!cacheJson.RefreshTokens,
+      hasRefreshToken: !!cacheJson.RefreshToken, 
+      cacheKeys: Object.keys(cacheJson)
+    });
+    
+    // Check if we have any tokens that look like refresh tokens
+    let refreshTokenFound = false;
+    for (const key in cacheJson) {
+      if (key.toLowerCase().includes('refresh')) {
+        refreshTokenFound = true;
+        console.log(`Found potential refresh token section: ${key}`);
+      }
+    }
+    
+    if (!refreshTokenFound) {
+      console.log('No refresh token sections found in cache after client credentials flow');
+    }
+    
+    // Client credentials flow won't typically have a refresh token
+    // since it's an app-only flow with no user context
+    res.json({
+      success: true,
+      message: 'Client credentials flow completed',
+      accessTokenPresent: !!response.accessToken,
+      expiresOn: response.expiresOn
+    });
+  } catch (error) {
+    console.error('Error in silent login:', error);
+    res.status(500).send(`Error in silent login: ${error.message}`);
+  }
+});
+
 // Setup the auth flow
 app.get('/', (req, res) => {
   console.log('Root route accessed, generating auth URL...');
@@ -125,7 +269,7 @@ app.get('/callback', (req, res) => {
   });
 
   cca.acquireTokenByCode(tokenRequest)
-    .then((response) => {
+    .then(async (response) => {
       try {
         // Log full response structure (without sensitive values)
         console.log('Token response structure:', {
@@ -144,6 +288,54 @@ app.get('/callback', (req, res) => {
           } : null
         });
 
+        // Get refresh token from token cache
+        const tokenCache = cca.getTokenCache();
+        const serializedCache = await tokenCache.serialize();
+        const cacheJson = JSON.parse(serializedCache);
+
+        // Log the full cache structure for debugging (excluding sensitive values)
+        console.log('Full token cache structure keys:', Object.keys(cacheJson));
+        if (cacheJson.RefreshToken) {
+          console.log('RefreshToken keys in cache:', Object.keys(cacheJson.RefreshToken));
+        } else if (cacheJson.RefreshTokens) {
+          console.log('RefreshTokens keys in cache:', Object.keys(cacheJson.RefreshTokens));
+        }
+
+        // Try different ways to get the refresh token
+        let refreshToken = null;
+
+        // Method 1: Check RefreshTokens (plural)
+        if (cacheJson.RefreshTokens && Object.keys(cacheJson.RefreshTokens).length > 0) {
+          const refreshTokenKeys = Object.keys(cacheJson.RefreshTokens);
+          refreshToken = cacheJson.RefreshTokens[refreshTokenKeys[0]].secret;
+          console.log('Refresh token found using RefreshTokens collection');
+        }
+        // Method 2: Check RefreshToken (singular)
+        else if (cacheJson.RefreshToken && Object.keys(cacheJson.RefreshToken).length > 0) {
+          const refreshTokenKeys = Object.keys(cacheJson.RefreshToken);
+          refreshToken = cacheJson.RefreshToken[refreshTokenKeys[0]].secret;
+          console.log('Refresh token found using RefreshToken collection');
+        }
+        // Method 3: Look for any key with "refresh" in it
+        else {
+          for (const cacheSection in cacheJson) {
+            if (cacheSection.toLowerCase().includes('refresh') && typeof cacheJson[cacheSection] === 'object') {
+              for (const key in cacheJson[cacheSection]) {
+                if (cacheJson[cacheSection][key] && cacheJson[cacheSection][key].secret) {
+                  refreshToken = cacheJson[cacheSection][key].secret;
+                  console.log(`Refresh token found in ${cacheSection}.${key}`);
+                  break;
+                }
+              }
+              if (refreshToken) break;
+            }
+          }
+        }
+
+        if (!refreshToken) {
+          console.log('Could not find refresh token in token cache');
+        }
+
         // Calculate token expiration (make sure it's never null)
         const expiresInSeconds = response.expiresIn || 3600;
         const expiresAt = Date.now() + (expiresInSeconds * 1000) - (5 * 60 * 1000);
@@ -157,23 +349,24 @@ app.get('/callback', (req, res) => {
         // Store tokens
         const tokenData = {
           accessToken: response.accessToken,
-          refreshToken: response.refreshToken || '',
+          refreshToken: refreshToken || '',
           expiresAt: expiresAt,
           tokenType: response.tokenType,
           scopes: response.scopes
         };
         
-        writeFileSync(TOKEN_FILE_PATH, JSON.stringify(tokenData, null, 2), 'utf8');
+        fs.writeFileSync(TOKEN_FILE_PATH, JSON.stringify(tokenData, null, 2), 'utf8');
         
         console.log('Authentication successful! Token saved to:', TOKEN_FILE_PATH);
+        console.log('Refresh token obtained:', refreshToken ? 'Yes' : 'No');
         
         // Format token display with safety checks
         const accessTokenDisplay = response.accessToken ? 
           `${response.accessToken.substring(0, 15)}...${response.accessToken.substring(response.accessToken.length - 5)}` : 
           'Not provided';
           
-        const refreshTokenDisplay = response.refreshToken ? 
-          `${response.refreshToken.substring(0, 10)}...${response.refreshToken.substring(response.refreshToken.length - 5)}` : 
+        const refreshTokenDisplay = refreshToken ? 
+          `${refreshToken.substring(0, 10)}...${refreshToken.substring(refreshToken.length - 5)}` : 
           'Not provided';
         
         res.send(`
@@ -189,9 +382,10 @@ app.get('/callback', (req, res) => {
           </ul>
           <p>Debug Information:</p>
           <pre>${JSON.stringify({
-            hasRefreshToken: !!response.refreshToken,
+            hasRefreshToken: !!refreshToken,
             tokenType: response.tokenType,
-            scopes: response.scopes
+            scopes: response.scopes,
+            cacheHasRefreshTokens: cacheJson.RefreshTokens && Object.keys(cacheJson.RefreshTokens).length > 0
           }, null, 2)}</pre>
         `);
       } catch (error) {
