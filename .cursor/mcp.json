@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "mstodo": {
+      "command": "npm",
+      "args": [
+        "run",
+        "start"
+      ],
+      "cwd": "/Users/jhirono/Dev/todoMCP/build/todo-index.js",
+      "env": {
+        "NODE_ENV": "production"
+      }
+    }
+  }
+}
